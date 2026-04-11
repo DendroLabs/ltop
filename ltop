@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""ltop: A 'top'-like display for local LLM processes and Claude Code sessions."""
+
+import curses
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+SESSIONS_DIR = CLAUDE_DIR / "sessions"
+TASKS_DIR = CLAUDE_DIR / "tasks"
+TODOS_DIR = CLAUDE_DIR / "todos"
+
+# Patterns to identify LLM-related processes (command substring -> label)
+LLM_PATTERNS = [
+    (r"(^|/)claude(\s|$)",             "Claude Code"),
+    (r"ollama\s+serve",                "Ollama Server"),
+    (r"ollama\s+run",                  "Ollama Model"),
+    (r"ollama_llama_server",           "Ollama Inference"),
+    (r"\bllama[-_]server\b",           "llama.cpp Server"),
+    (r"\bllama[-_]cli\b",              "llama.cpp CLI"),
+    (r"\bmain\b.*gguf",                "llama.cpp"),
+    (r"LM\s*Studio|lmstudio",          "LM Studio"),
+    (r"\bvllm\b",                      "vLLM"),
+    (r"(^|[/\s])mlx[_-](lm|server)",   "MLX LM"),
+    (r"text-generation-server",        "TGI"),
+    (r"koboldcpp",                     "KoboldCpp"),
+    (r"localai",                       "LocalAI"),
+    (r"tabbyAPI|tabby",                "TabbyAPI"),
+    (r"\bwhisper\b",                   "Whisper"),
+    (r"stable.diffusion|comfy",        "Diffusion"),
+    (r"(^|/)aider(\s|$)",              "Aider"),
+    (r"github-copilot|gh\s+copilot",   "Copilot"),
+    (r"continue\.dev|continue-server", "Continue"),
+]
+
+DEFAULT_INTERVAL = 3
+
+# How recently a Claude session must have written to its transcript
+# to count as "active" (vs idle).
+ACTIVE_WINDOW_SECONDS = 60
+
+
+def etime_seconds(s: str) -> int:
+    """Parse ps etime: 'MM:SS', 'HH:MM:SS', or 'DD-HH:MM:SS' to seconds."""
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        try:
+            days = int(d)
+        except ValueError:
+            pass
+    try:
+        parts = [int(x) for x in s.split(":")]
+    except ValueError:
+        return 0
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts
+    return days * 86400 + h * 3600 + m * 60 + sec
+
+
+SORT_MODES = {
+    "cpu":  ("CPU",  lambda p: -p["cpu"]),
+    "mem":  ("MEM",  lambda p: -p["rss_mb"]),
+    "time": ("TIME", lambda p: -etime_seconds(p["elapsed"])),
+}
+
+
+def get_llm_processes() -> list[dict]:
+    """Scan running processes and identify LLM-related ones."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,ppid,%cpu,%mem,rss,etime,command"],
+            capture_output=True, text=True
+        )
+    except Exception:
+        return []
+
+    procs = []
+    seen_pids = set()
+
+    for line in result.stdout.strip().split("\n")[1:]:  # skip header
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+
+        pid_str, ppid_str, cpu_str, mem_str, rss_str, etime_str, command = parts
+
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+
+        # Match against LLM patterns
+        label = None
+        for pattern, name in LLM_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                label = name
+                break
+
+        if label is None:
+            continue
+
+        # Skip grep of ourselves
+        if pid == os.getpid():
+            continue
+        if "/ltop" in command or command.endswith(" ltop") or command == "ltop":
+            continue
+
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+
+        try:
+            cpu = float(cpu_str)
+            mem = float(mem_str)
+            rss_kb = int(rss_str)
+            ppid = int(ppid_str)
+        except ValueError:
+            cpu, mem, rss_kb, ppid = 0.0, 0.0, 0, 0
+
+        procs.append({
+            "pid": pid,
+            "ppid": ppid,
+            "cpu": cpu,
+            "mem": mem,
+            "rss_mb": rss_kb / 1024,
+            "elapsed": etime_str.strip(),
+            "command": command,
+            "label": label,
+        })
+
+    return procs
+
+
+def load_claude_sessions() -> dict[int, dict]:
+    """Load Claude Code session data keyed by PID."""
+    if not SESSIONS_DIR.is_dir():
+        return {}
+
+    sessions = {}
+    for f in SESSIONS_DIR.iterdir():
+        if f.suffix != ".json":
+            continue
+        try:
+            data = json.loads(f.read_text())
+            pid = data.get("pid")
+            if pid:
+                sid = data.get("sessionId", "")
+                data["tasks"] = load_tasks(sid)
+                main_todos, subagents = load_agents(sid)
+                data["main_todos"] = main_todos
+                data["subagents"] = subagents
+                sessions[pid] = data
+        except (json.JSONDecodeError, OSError):
+            continue
+    return sessions
+
+
+def load_tasks(session_id: str) -> list[dict]:
+    """Load tasks for a session."""
+    task_dir = TASKS_DIR / session_id
+    if not task_dir.is_dir():
+        return []
+
+    tasks = []
+    for f in task_dir.iterdir():
+        if f.suffix != ".json":
+            continue
+        try:
+            tasks.append(json.loads(f.read_text()))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    def sort_key(t):
+        try:
+            return int(t.get("id", 0))
+        except (ValueError, TypeError):
+            return 0
+    tasks.sort(key=sort_key)
+    return tasks
+
+
+def load_agents(session_id: str) -> tuple[list[dict], list[dict]]:
+    """Load main agent todos and subagent info from the todos directory.
+
+    Returns (main_todos, subagents) where each subagent is a dict with
+    'agent_id' and 'todos' keys.
+    """
+    if not TODOS_DIR.is_dir() or not session_id:
+        return [], []
+
+    main_todos = []
+    subagents = []
+    prefix = f"{session_id}-agent-"
+
+    for f in TODOS_DIR.iterdir():
+        if f.suffix != ".json" or not f.stem.startswith(prefix):
+            continue
+        agent_id = f.stem[len(prefix):]
+        try:
+            data = json.loads(f.read_text())
+            if not isinstance(data, list):
+                continue
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        if agent_id == session_id:
+            main_todos = data
+        else:
+            if data:  # only include subagents that have todos
+                subagents.append({
+                    "agent_id": agent_id,
+                    "todos": data,
+                })
+
+    return main_todos, subagents
+
+
+def agent_todo_summary(todos: list[dict]) -> str:
+    """One-line summary of a todo list."""
+    if not todos:
+        return ""
+    total = len(todos)
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    active = [t for t in todos if t.get("status") == "in_progress"]
+    label = ""
+    if active:
+        t = active[0]
+        label = t.get("activeForm") or t.get("content", "")
+        if len(label) > 35:
+            label = label[:32] + "..."
+    return f"{done}/{total} {label}"
+
+
+def agent_progress_mini(todos: list[dict], width: int = 10) -> str:
+    """Tiny progress bar for a todo list."""
+    if not todos:
+        return ""
+    total = len(todos)
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    active = sum(1 for t in todos if t.get("status") == "in_progress")
+    filled = round(done / total * width)
+    partial = round(active / total * width)
+    empty = width - filled - partial
+    return "#" * filled + ":" * partial + "-" * empty
+
+
+def get_gpu_utilization() -> int | None:
+    """Sudoless macOS GPU utilization via ioreg. Returns 0-100 or None."""
+    try:
+        result = subprocess.run(
+            ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+            capture_output=True, text=True, timeout=2
+        )
+    except Exception:
+        return None
+    m = re.search(r'"Device Utilization %"=(\d+)', result.stdout)
+    return int(m.group(1)) if m else None
+
+
+_SESSION_INFO_CACHE: dict[str, tuple[float, str | None]] = {}
+
+
+def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | None]:
+    """Return (model, last_activity_mtime) for a Claude session via its transcript jsonl."""
+    if not cwd or not session_id:
+        return None, None
+    encoded = cwd.replace("/", "-")
+    path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None, None
+    key = str(path)
+    cached = _SESSION_INFO_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1], mtime
+    model = None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 32768))
+            tail = f.read().decode("utf-8", errors="ignore")
+        for line in reversed(tail.splitlines()):
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = d.get("message")
+            if isinstance(msg, dict) and msg.get("model"):
+                model = msg["model"]
+                break
+    except OSError:
+        pass
+    _SESSION_INFO_CACHE[key] = (mtime, model)
+    return model, mtime
+
+
+def short_model(model: str | None) -> str:
+    """claude-opus-4-6 -> opus-4.6, claude-sonnet-4-5-20251022 -> sonnet-4.5."""
+    if not model:
+        return ""
+    m = model.replace("claude-", "")
+    m = re.sub(r"-\d{8}$", "", m)
+    m = re.sub(r"^([a-z]+)-(\d+)-(\d+)$", r"\1-\2.\3", m)
+    return m
+
+
+def get_ollama_running() -> list[dict]:
+    """Get currently loaded Ollama models via 'ollama ps'."""
+    try:
+        result = subprocess.run(
+            ["ollama", "ps"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    models = []
+    for line in result.stdout.strip().split("\n")[1:]:  # skip header
+        parts = line.split()
+        if len(parts) >= 1:
+            models.append({"name": parts[0], "raw": line.strip()})
+    return models
+
+
+def shorten_path(path: str, max_len: int = 35) -> str:
+    home = str(Path.home())
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    if len(path) <= max_len:
+        return path
+    return "..." + path[-(max_len - 3):]
+
+
+def format_rss(mb: float) -> str:
+    if mb >= 1024:
+        return f"{mb / 1024:.1f}G"
+    elif mb >= 1:
+        return f"{mb:.0f}M"
+    else:
+        return f"{mb * 1024:.0f}K"
+
+
+def task_summary(tasks: list[dict]) -> str:
+    """One-line task summary: 'done/total taskname'."""
+    if not tasks:
+        return ""
+    total = len(tasks)
+    done = sum(1 for t in tasks if t.get("status") == "completed")
+    active = [t for t in tasks if t.get("status") == "in_progress"]
+    label = ""
+    if active:
+        t = active[0]
+        label = t.get("activeForm") or t.get("subject", "")
+        if len(label) > 30:
+            label = label[:27] + "..."
+    return f"{done}/{total} {label}"
+
+
+def progress_mini(tasks: list[dict], width: int = 12) -> str:
+    """Tiny progress bar."""
+    if not tasks:
+        return ""
+    total = len(tasks)
+    done = sum(1 for t in tasks if t.get("status") == "completed")
+    active = sum(1 for t in tasks if t.get("status") == "in_progress")
+    filled = round(done / total * width)
+    partial = round(active / total * width)
+    empty = width - filled - partial
+    return "#" * filled + ":" * partial + "-" * empty
+
+
+def draw(stdscr, interval: int):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    curses.use_default_colors()
+
+    if curses.has_colors():
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_CYAN, -1)
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)
+
+    COL_GREEN = curses.color_pair(1) if curses.has_colors() else curses.A_NORMAL
+    COL_RED = curses.color_pair(2) if curses.has_colors() else curses.A_NORMAL
+    COL_CYAN = curses.color_pair(3) if curses.has_colors() else curses.A_NORMAL
+    COL_YELLOW = curses.color_pair(4) if curses.has_colors() else curses.A_NORMAL
+    COL_MAGENTA = curses.color_pair(5) if curses.has_colors() else curses.A_NORMAL
+    COL_DIM = curses.A_DIM
+    COL_BOLD = curses.A_BOLD
+
+    LABEL_COLORS = {
+        "Claude Code":       COL_GREEN | COL_BOLD,
+        "Ollama Server":     COL_CYAN,
+        "Ollama Model":      COL_CYAN | COL_BOLD,
+        "Ollama Inference":  COL_CYAN,
+        "llama.cpp Server":  COL_YELLOW,
+        "llama.cpp CLI":     COL_YELLOW,
+        "llama.cpp":         COL_YELLOW,
+        "MLX LM":            COL_MAGENTA,
+        "Aider":             COL_GREEN,
+        "Copilot":           COL_GREEN,
+        "Continue":          COL_GREEN,
+    }
+
+    sort_mode = "cpu"
+    paused = False
+    procs: list[dict] = []
+    claude_sessions: dict[int, dict] = {}
+    ollama_models: list[dict] = []
+    gpu: int | None = None
+
+    while True:
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+        row = 0
+
+        if not paused:
+            procs = get_llm_processes()
+            claude_sessions = load_claude_sessions()
+            ollama_models = get_ollama_running()
+            gpu = get_gpu_utilization()
+
+        procs.sort(key=SORT_MODES[sort_mode][1])
+        now_str = datetime.now().strftime("%H:%M:%S")
+
+        # -- Title bar --
+        total_cpu = sum(p["cpu"] for p in procs)
+        total_mem = sum(p["rss_mb"] for p in procs)
+        gpu_part = f"  |  GPU: {gpu}%" if gpu is not None else ""
+        pause_part = "  |  PAUSED" if paused else ""
+        title = f" ltop  |  {len(procs)} processes  |  CPU: {total_cpu:.1f}%{gpu_part}  |  MEM: {format_rss(total_mem)}  |  {now_str}{pause_part} "
+        try:
+            stdscr.addstr(row, 0, title.ljust(max_x - 1), curses.A_REVERSE | COL_BOLD)
+        except curses.error:
+            pass
+        row += 1
+
+        # -- Ollama loaded models (if any) --
+        if ollama_models:
+            try:
+                stdscr.addstr(row, 0, f" Ollama models loaded: {', '.join(m['name'] for m in ollama_models)}", COL_CYAN)
+            except curses.error:
+                pass
+            row += 1
+
+        row += 1  # blank line
+
+        # -- Column headers --
+        hdr = f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TYPE':<20}  {'DETAILS'}"
+        try:
+            stdscr.addstr(row, 0, hdr[:max_x - 1], COL_BOLD | curses.A_UNDERLINE)
+        except curses.error:
+            pass
+        row += 1
+
+        if not procs:
+            row += 1
+            try:
+                stdscr.addstr(row, 0, "  No LLM processes found.", COL_DIM)
+            except curses.error:
+                pass
+            row += 2
+        else:
+            # -- Process rows --
+            for p in procs:
+                if row >= max_y - 3:
+                    break
+
+                pid = p["pid"]
+                label = p["label"]
+                details = ""
+                is_idle = False
+
+                # Enrich Claude Code rows with session info
+                if label == "Claude Code" and pid in claude_sessions:
+                    sess = claude_sessions[pid]
+                    cwd_full = sess.get("cwd", "")
+                    cwd = shorten_path(cwd_full)
+                    model_id, last_active = get_session_info(cwd_full, sess.get("sessionId", ""))
+                    model = short_model(model_id)
+                    model_tag = f" [{model}]" if model else ""
+                    if last_active is not None:
+                        is_idle = (time.time() - last_active) > ACTIVE_WINDOW_SECONDS
+                    tasks = sess.get("tasks", [])
+                    subagents = sess.get("subagents", [])
+                    n_agents = 1 + len(subagents)
+                    agent_tag = f"  ({n_agents} agents)" if n_agents > 1 else ""
+                    if tasks:
+                        tsumm = task_summary(tasks)
+                        pbar = progress_mini(tasks)
+                        details = f"{cwd}{model_tag}  [{pbar}] {tsumm}{agent_tag}"
+                    else:
+                        details = f"{cwd}{model_tag}{agent_tag}"
+                else:
+                    # Show shortened command
+                    cmd = p["command"]
+                    if len(cmd) > 50:
+                        cmd = cmd[:47] + "..."
+                    details = cmd
+
+                line = (
+                    f"{pid:>7}  "
+                    f"{p['cpu']:>5.1f}  "
+                    f"{p['mem']:>5.1f}  "
+                    f"{format_rss(p['rss_mb']):>6}  "
+                    f"{p['elapsed']:>10}  "
+                    f"{label:<20}  "
+                    f"{details}"
+                )
+
+                attr = LABEL_COLORS.get(label, curses.A_NORMAL)
+                if is_idle:
+                    attr = COL_DIM
+                # Highlight high CPU
+                if p["cpu"] > 50:
+                    attr = COL_RED | COL_BOLD
+
+                try:
+                    stdscr.addstr(row, 0, line[:max_x - 1], attr)
+                except curses.error:
+                    pass
+                row += 1
+
+                # For Claude Code, show tasks and subagents below
+                if label == "Claude Code" and pid in claude_sessions:
+                    sess_data = claude_sessions[pid]
+                    tasks = sess_data.get("tasks", [])
+                    subagents = sess_data.get("subagents", [])
+
+                    # Render main agent tasks
+                    for t in tasks:
+                        if row >= max_y - 3:
+                            break
+                        status = t.get("status", "pending")
+                        if status == "completed":
+                            sym, tattr = "[done]", COL_GREEN | COL_DIM
+                        elif status == "in_progress":
+                            sym, tattr = "[ >> ]", COL_CYAN
+                        else:
+                            sym, tattr = "[    ]", COL_DIM
+
+                        subj = t.get("subject", "")
+                        if status == "in_progress":
+                            subj = t.get("activeForm") or subj
+                        if len(subj) > 55:
+                            subj = subj[:52] + "..."
+
+                        task_line = f"{'':>44}  {sym} {subj}"
+                        try:
+                            stdscr.addstr(row, 0, task_line[:max_x - 1], tattr)
+                        except curses.error:
+                            pass
+                        row += 1
+
+                    # Render subagents
+                    for sa in subagents:
+                        if row >= max_y - 3:
+                            break
+                        todos = sa["todos"]
+                        aid_short = sa["agent_id"][:8]
+                        pbar = agent_progress_mini(todos)
+                        summ = agent_todo_summary(todos)
+
+                        sa_line = f"{'':>10}+-agent {aid_short}  [{pbar}] {summ}"
+                        try:
+                            stdscr.addstr(row, 0, sa_line[:max_x - 1], COL_MAGENTA)
+                        except curses.error:
+                            pass
+                        row += 1
+
+                        # Show individual subagent todos
+                        for t in todos:
+                            if row >= max_y - 3:
+                                break
+                            status = t.get("status", "pending")
+                            if status == "completed":
+                                sym, tattr = "[done]", COL_GREEN | COL_DIM
+                            elif status == "in_progress":
+                                sym, tattr = "[ >> ]", COL_MAGENTA
+                            else:
+                                sym, tattr = "[    ]", COL_DIM
+
+                            content = t.get("content", "")
+                            if status == "in_progress":
+                                content = t.get("activeForm") or content
+                            if len(content) > 50:
+                                content = content[:47] + "..."
+
+                            todo_line = f"{'':>44}  {sym} {content}"
+                            try:
+                                stdscr.addstr(row, 0, todo_line[:max_x - 1], tattr)
+                            except curses.error:
+                                pass
+                            row += 1
+
+        # -- Footer --
+        footer_row = max_y - 1
+        sort_label = SORT_MODES[sort_mode][0]
+        footer = (
+            f" q:quit  p:cpu m:mem t:time  space:{'resume' if paused else 'pause'}"
+            f"  sort:{sort_label}  interval:{interval}s "
+        )
+        try:
+            stdscr.addstr(footer_row, 0, footer.ljust(max_x - 1), curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+
+        # Wait, checking for input every 100ms
+        for _ in range(interval * 10):
+            key = stdscr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                return
+            elif key == ord("p"):
+                sort_mode = "cpu"
+                break
+            elif key == ord("m"):
+                sort_mode = "mem"
+                break
+            elif key == ord("t"):
+                sort_mode = "time"
+                break
+            elif key == ord(" "):
+                paused = not paused
+                break
+            time.sleep(0.1)
+
+
+def static_output():
+    """One-shot plain text output for piping."""
+    procs = get_llm_processes()
+    procs.sort(key=SORT_MODES["cpu"][1])
+    claude_sessions = load_claude_sessions()
+
+    if not procs:
+        print("No LLM processes found.")
+        return
+
+    print(f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TYPE':<20}  DETAILS")
+    print("-" * 90)
+
+    for p in procs:
+        pid = p["pid"]
+        label = p["label"]
+        details = ""
+
+        if label == "Claude Code" and pid in claude_sessions:
+            sess = claude_sessions[pid]
+            cwd_full = sess.get("cwd", "")
+            cwd = shorten_path(cwd_full)
+            model_id, _ = get_session_info(cwd_full, sess.get("sessionId", ""))
+            model = short_model(model_id)
+            model_tag = f" [{model}]" if model else ""
+            tasks = sess.get("tasks", [])
+            subagents = sess.get("subagents", [])
+            n_agents = 1 + len(subagents)
+            agent_tag = f"  ({n_agents} agents)" if n_agents > 1 else ""
+            if tasks:
+                details = f"{cwd}{model_tag}  {task_summary(tasks)}{agent_tag}"
+            else:
+                details = f"{cwd}{model_tag}{agent_tag}"
+        else:
+            cmd = p["command"]
+            if len(cmd) > 50:
+                cmd = cmd[:47] + "..."
+            details = cmd
+
+        print(
+            f"{pid:>7}  "
+            f"{p['cpu']:>5.1f}  "
+            f"{p['mem']:>5.1f}  "
+            f"{format_rss(p['rss_mb']):>6}  "
+            f"{p['elapsed']:>10}  "
+            f"{label:<20}  "
+            f"{details}"
+        )
+
+        # Show subagents in static output too
+        if label == "Claude Code" and pid in claude_sessions:
+            for sa in claude_sessions[pid].get("subagents", []):
+                todos = sa["todos"]
+                aid_short = sa["agent_id"][:8]
+                pbar = agent_progress_mini(todos)
+                summ = agent_todo_summary(todos)
+                print(f"{'':>10}+-agent {aid_short}  [{pbar}] {summ}")
+
+
+def main():
+    once = "--once" in sys.argv or "-1" in sys.argv
+
+    interval = DEFAULT_INTERVAL
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg.startswith("--interval="):
+            try:
+                interval = max(1, int(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
+        elif arg.startswith("-n") and len(arg) > 2:
+            try:
+                interval = max(1, int(arg[2:]))
+            except ValueError:
+                pass
+        elif arg == "-n" and i + 1 < len(argv):
+            try:
+                interval = max(1, int(argv[i + 1]))
+            except ValueError:
+                pass
+
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("ltop: A 'top'-like display for local LLM processes and Claude Code sessions")
+        print()
+        print("Usage: ltop [OPTIONS]")
+        print()
+        print("Options:")
+        print("  -n, --interval=N   Refresh interval in seconds (default: 3)")
+        print("  -1, --once         Print once and exit (no TUI)")
+        print("  -h, --help         Show this help")
+        print()
+        print("Interactive keys:")
+        print("  q / Esc   Quit")
+        print("  p         Sort by CPU")
+        print("  m         Sort by memory")
+        print("  t         Sort by elapsed time")
+        print("  space     Pause / resume refresh")
+        return
+
+    if once or not sys.stdout.isatty():
+        static_output()
+    else:
+        try:
+            curses.wrapper(lambda stdscr: draw(stdscr, interval))
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
