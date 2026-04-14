@@ -167,7 +167,7 @@ ltop --help
 
 Any process matching one of the built-in patterns gets a type label and a color:
 
-- Claude Code, Aider, Copilot (`gh copilot`), Continue
+- Claude Code, opencode, Aider, Copilot (`gh copilot`), Continue
 - Ollama (server, model, inference), llama.cpp (server, cli, main+gguf)
 - vLLM, MLX LM, LM Studio, TGI, KoboldCpp, LocalAI, TabbyAPI
 - Whisper, Stable Diffusion / ComfyUI

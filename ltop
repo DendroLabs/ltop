@@ -26,6 +26,7 @@ TODOS_DIR = CLAUDE_DIR / "todos"
 # Patterns to identify LLM-related processes (command substring -> label)
 LLM_PATTERNS = [
     (r"(^|/)claude(\s|$)",             "Claude Code"),
+    (r"(^|/)opencode(\s|$)",           "opencode"),
     (r"ollama\s+serve",                "Ollama Server"),
     (r"ollama\s+run",                  "Ollama Model"),
     (r"ollama_llama_server",           "Ollama Inference"),
