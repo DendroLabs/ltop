@@ -6,6 +6,7 @@ import json
 import locale
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -22,6 +23,8 @@ CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 TASKS_DIR = CLAUDE_DIR / "tasks"
 TODOS_DIR = CLAUDE_DIR / "todos"
+
+OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 
 # Patterns to identify LLM-related processes (command substring -> label)
 LLM_PATTERNS = [
@@ -438,6 +441,105 @@ def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | Non
     return model, mtime, ctx_tokens
 
 
+_OPENCODE_INFO_CACHE: dict[str, tuple[float, str | None, float | None, int | None]] = {}
+
+
+def _opencode_db_mtime() -> float | None:
+    """Max mtime across the opencode SQLite files (the WAL lags the main db)."""
+    latest: float | None = None
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            m = (OPENCODE_DB.parent / f"{OPENCODE_DB.name}{suffix}").stat().st_mtime
+        except OSError:
+            continue
+        if latest is None or m > latest:
+            latest = m
+    return latest
+
+
+def get_process_cwd(pid: int) -> str | None:
+    """Resolve a process's cwd. psutil on any OS, /proc on Linux as fallback."""
+    if HAVE_PSUTIL:
+        try:
+            return psutil.Process(pid).cwd()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return None
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
+
+
+def get_opencode_info(cwd: str | None) -> tuple[str | None, float | None, int | None]:
+    """Return (model, last_activity_epoch, context_tokens) for an opencode session.
+
+    Looks up the most recent assistant message tied to the session whose
+    `directory` column matches the process cwd. If cwd is None (can't resolve)
+    or no match exists, falls back to the globally most-recent assistant
+    message — good enough when a single opencode instance is active.
+
+    Tokens are input + cache.read + cache.write to match the Claude Code
+    "context size" semantic (what `/context` reports) rather than total
+    including output.
+    """
+    db_mtime = _opencode_db_mtime()
+    if db_mtime is None:
+        return None, None, None
+
+    key = cwd or "__latest__"
+    cached = _OPENCODE_INFO_CACHE.get(key)
+    if cached and cached[0] == db_mtime:
+        return cached[1], cached[2], cached[3]
+
+    model: str | None = None
+    last_activity: float | None = None
+    ctx_tokens: int | None = None
+    try:
+        conn = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=0.5)
+        try:
+            if cwd:
+                row = conn.execute(
+                    "SELECT m.data, m.time_created FROM message m "
+                    "JOIN session s ON s.id = m.session_id "
+                    "WHERE s.directory = ? "
+                    "  AND m.data LIKE '%\"role\":\"assistant\"%' "
+                    "ORDER BY m.time_created DESC LIMIT 1",
+                    (cwd,),
+                ).fetchone()
+            else:
+                row = None
+            if row is None:
+                row = conn.execute(
+                    "SELECT data, time_created FROM message "
+                    "WHERE data LIKE '%\"role\":\"assistant\"%' "
+                    "ORDER BY time_created DESC LIMIT 1"
+                ).fetchone()
+        finally:
+            conn.close()
+        if row:
+            data_str, tc_ms = row
+            try:
+                d = json.loads(data_str)
+            except json.JSONDecodeError:
+                d = None
+            if isinstance(d, dict):
+                model = d.get("modelID")
+                last_activity = (tc_ms or 0) / 1000.0
+                tok = d.get("tokens") or {}
+                if isinstance(tok, dict):
+                    cache = tok.get("cache") or {}
+                    ctx_tokens = (
+                        int(tok.get("input") or 0)
+                        + int(cache.get("read") or 0)
+                        + int(cache.get("write") or 0)
+                    )
+    except sqlite3.Error:
+        pass
+
+    _OPENCODE_INFO_CACHE[key] = (db_mtime, model, last_activity, ctx_tokens)
+    return model, last_activity, ctx_tokens
+
+
 _RUNNING_AGENTS_CACHE: dict[str, tuple[float, list[dict]]] = {}
 
 
@@ -767,6 +869,15 @@ def draw(stdscr, interval: int):
                         details = f"{cwd}{model_tag}  [{pbar}] {tsumm}{agent_tag}"
                     else:
                         details = f"{cwd}{model_tag}{agent_tag}"
+                elif label == "opencode":
+                    cwd_full = get_process_cwd(pid)
+                    model_id, last_active, tokens = get_opencode_info(cwd_full)
+                    cwd = shorten_path(cwd_full) if cwd_full else ""
+                    model = short_model(model_id)
+                    model_tag = f" [{model}]" if model else ""
+                    if last_active is not None:
+                        is_idle = (time.time() - last_active) > ACTIVE_WINDOW_SECONDS
+                    details = f"{cwd}{model_tag}".strip() or p["command"][:50]
                 else:
                     # Show shortened command
                     cmd = p["command"]
@@ -775,11 +886,11 @@ def draw(stdscr, interval: int):
                     details = cmd
 
                 # Activity LED: block char. Blinking green = tokens flowing
-                # (count changed within the last LED_HOLD ticks). Steady amber
-                # = idle. Non-Claude rows get a blank slot.
+                # (count changed within the last LED_HOLD ticks). Steady white
+                # = idle. Rows without token enrichment get a blank slot.
                 led_char = " "
                 led_attr = curses.A_NORMAL
-                if label == "Claude Code":
+                if label in ("Claude Code", "opencode"):
                     if not paused and tokens is not None:
                         prev = prev_tokens.get(pid)
                         if prev is not None and tokens != prev:

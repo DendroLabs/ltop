@@ -54,7 +54,8 @@ Existing tools cover one half of the picture:
 
 - **htop-style live view** of local LLM-adjacent processes with CPU%, MEM%, RSS, elapsed time.
 - **Claude Code session introspection** — resolves PID → session, shows cwd, model id (e.g. `opus-4.6`), task list with progress bar, subagent tree with per-agent todos.
-- **Idle/active dimming** — Claude sessions whose transcript hasn't been written in the last 60s render dimmed, so the session that's actually working right now jumps out.
+- **opencode session introspection** — resolves PID → cwd → session via opencode's SQLite store (`~/.local/share/opencode/opencode.db`), shows the same TOKENS column and `[model]` tag. Works regardless of the underlying provider (Anthropic direct, GitHub Copilot, etc.).
+- **Idle/active dimming** — Claude and opencode sessions whose transcripts haven't been written in the last 60s render dimmed, so the session that's actually working right now jumps out.
 - **macOS GPU utilization** in the title bar, sudoless, via `ioreg`.
 - **Sort toggles** — `p` CPU, `m` memory, `t` elapsed time. **Pause** with space.
 - **Ollama loaded-model banner** via `ollama ps`.
