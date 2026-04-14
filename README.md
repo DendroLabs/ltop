@@ -36,17 +36,85 @@ Existing tools cover one half of the picture:
 
 ## Install
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/DendroLabs/ltop/main/ltop -o /usr/local/bin/ltop
-chmod +x /usr/local/bin/ltop
-```
+`ltop` is a single Python file. "Installing" means downloading it to a directory on your `PATH` and marking it executable. Pick whichever of the below matches your OS.
 
-Or put it anywhere on your `PATH`. On Apple Silicon, `/opt/homebrew/bin` is typically user-writable:
+### macOS (Apple Silicon)
+
+`/opt/homebrew/bin` is already on your `PATH` and writable by your user:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/DendroLabs/ltop/main/ltop -o /opt/homebrew/bin/ltop
 chmod +x /opt/homebrew/bin/ltop
 ```
+
+### macOS (Intel) / Linux — system-wide
+
+```sh
+sudo curl -fsSL https://raw.githubusercontent.com/DendroLabs/ltop/main/ltop -o /usr/local/bin/ltop
+sudo chmod +x /usr/local/bin/ltop
+```
+
+### Linux / macOS — user-local (no sudo)
+
+Good if you don't have root, or you just prefer keeping stuff in your home directory:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/DendroLabs/ltop/main/ltop -o ~/.local/bin/ltop
+chmod +x ~/.local/bin/ltop
+```
+
+If `~/.local/bin` isn't already on your `PATH`, add it:
+
+```sh
+# bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+
+# zsh (macOS default, many Linux distros)
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+
+# fish
+fish_add_path ~/.local/bin
+```
+
+### Windows
+
+Windows needs two extra pip packages so curses and process listing work:
+
+```powershell
+pip install psutil windows-curses
+```
+
+Then download the script and put it somewhere on `PATH` (PowerShell):
+
+```powershell
+# pick a dir that's on PATH, e.g. %USERPROFILE%\bin
+$dest = "$env:USERPROFILE\bin"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/DendroLabs/ltop/main/ltop `
+                  -OutFile "$dest\ltop.py"
+```
+
+Add the dir to your user `PATH` once (takes effect in new shells):
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+    "PATH",
+    "$env:PATH;$env:USERPROFILE\bin",
+    [EnvironmentVariableTarget]::User)
+```
+
+Then run with `python ltop.py` (or create a one-line `ltop.cmd` shim:  
+`@python "%USERPROFILE%\bin\ltop.py" %*`).
+
+### Verify
+
+```sh
+ltop --help
+ltop --once
+```
+
+`--once` prints a single snapshot and exits — handy for confirming everything works without dropping into the full TUI.
 
 ## Usage
 
@@ -66,6 +134,7 @@ ltop --help
 | `p`     | Sort by CPU               |
 | `m`     | Sort by memory            |
 | `t`     | Sort by elapsed time      |
+| `k`     | Sort by token count       |
 | `space` | Pause / resume refresh    |
 
 ## What it recognizes
@@ -93,14 +162,14 @@ Nothing to configure — if the session files exist, they show up.
 ## Requirements
 
 - Python 3.10+ (uses `str | None` unions)
-- A POSIX `ps` with `-eo pid,ppid,%cpu,%mem,rss,etime,command`
+- A POSIX `ps` with `-eo pid,ppid,%cpu,%mem,rss,etime,command` — **or** `psutil` (required on Windows, optional elsewhere)
 - macOS for GPU display (Linux/NVIDIA users: see below)
 
 ## Platform notes
 
 - **macOS**: fully supported. GPU utilization comes from `ioreg -c IOAccelerator` (sudoless).
 - **Linux**: processes and Claude Code enrichment work. The GPU title-bar segment will be blank — patches welcome to parse `nvidia-smi` or ROCm equivalents.
-- **Windows**: not supported (curses + ps).
+- **Windows**: supported via `psutil` + `windows-curses` (see install section). `ps` isn't used on Windows — process enumeration falls back to `psutil`. GPU title-bar segment is blank.
 
 ## Related projects
 

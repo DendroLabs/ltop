@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""ltop: A 'top'-like display for local LLM processes and Claude Code sessions."""
+"""ltop: A 'top'-like display for local LLM processes."""
 
 import curses
 import json
+import locale
 import os
 import re
 import subprocess
@@ -10,6 +11,12 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import psutil  # optional; required on Windows, enables cross-platform
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
 
 CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
@@ -69,11 +76,107 @@ SORT_MODES = {
     "cpu":  ("CPU",  lambda p: -p["cpu"]),
     "mem":  ("MEM",  lambda p: -p["rss_mb"]),
     "time": ("TIME", lambda p: -etime_seconds(p["elapsed"])),
+    "tok":  ("TOK",  lambda p: -(p.get("tokens") or 0)),
 }
 
 
-def get_llm_processes() -> list[dict]:
-    """Scan running processes and identify LLM-related ones."""
+def _format_elapsed(secs: int) -> str:
+    """Format seconds into ps-style elapsed: MM:SS / HH:MM:SS / DD-HH:MM:SS."""
+    if secs < 0:
+        secs = 0
+    days, secs = divmod(secs, 86400)
+    hours, secs = divmod(secs, 3600)
+    minutes, seconds = divmod(secs, 60)
+    if days > 0:
+        return f"{days:d}-{hours:02d}:{minutes:02d}:{seconds:02d}"
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _match_label(command: str) -> str | None:
+    for pattern, name in LLM_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return name
+    return None
+
+
+# Cache of psutil.Process objects across refresh ticks so cpu_percent()
+# can compute a proper delta (first call after creation returns 0.0).
+_PSUTIL_PROC_CACHE: dict = {}
+
+
+def _get_llm_processes_psutil() -> list[dict]:
+    procs: list[dict] = []
+    alive_pids: set[int] = set()
+    self_pid = os.getpid()
+
+    attrs = ["pid", "ppid", "name", "cmdline", "create_time",
+             "memory_percent", "memory_info"]
+
+    for proc in psutil.process_iter(attrs=attrs):
+        try:
+            info = proc.info
+            pid = info["pid"]
+            alive_pids.add(pid)
+            if pid == self_pid:
+                continue
+
+            cmdline = info.get("cmdline") or []
+            command = " ".join(cmdline) if cmdline else (info.get("name") or "")
+            if not command:
+                continue
+            if "ltop" in command:
+                continue
+
+            label = _match_label(command)
+            if label is None:
+                continue
+
+            # CPU% via cached Process so we get a real delta on subsequent ticks.
+            cached = _PSUTIL_PROC_CACHE.get(pid)
+            if cached is None:
+                _PSUTIL_PROC_CACHE[pid] = proc
+                try:
+                    proc.cpu_percent(None)  # prime baseline
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                cpu = 0.0
+            else:
+                try:
+                    cpu = cached.cpu_percent(None)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    cpu = 0.0
+
+            mem = float(info.get("memory_percent") or 0.0)
+            mi = info.get("memory_info")
+            rss_mb = (mi.rss / (1024 * 1024)) if mi else 0.0
+            ct = info.get("create_time") or 0
+            elapsed = _format_elapsed(int(time.time() - ct)) if ct else "00:00"
+            ppid = info.get("ppid") or 0
+
+            procs.append({
+                "pid": pid,
+                "ppid": ppid,
+                "cpu": cpu,
+                "mem": mem,
+                "rss_mb": rss_mb,
+                "elapsed": elapsed,
+                "command": command,
+                "label": label,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    for pid in list(_PSUTIL_PROC_CACHE.keys()):
+        if pid not in alive_pids:
+            _PSUTIL_PROC_CACHE.pop(pid, None)
+
+    return procs
+
+
+def _get_llm_processes_ps() -> list[dict]:
+    """Fallback using BSD/GNU ps. Works on macOS and Linux only."""
     try:
         result = subprocess.run(
             ["ps", "-eo", "pid,ppid,%cpu,%mem,rss,etime,command"],
@@ -114,7 +217,7 @@ def get_llm_processes() -> list[dict]:
         # Skip grep of ourselves
         if pid == os.getpid():
             continue
-        if "/ltop" in command or command.endswith(" ltop") or command == "ltop":
+        if "ltop" in command:
             continue
 
         if pid in seen_pids:
@@ -141,6 +244,17 @@ def get_llm_processes() -> list[dict]:
         })
 
     return procs
+
+
+def get_llm_processes() -> list[dict]:
+    """Scan running processes and identify LLM-related ones.
+
+    Uses psutil when available (required for Windows, more robust on
+    Linux/macOS) and falls back to ps(1) otherwise.
+    """
+    if HAVE_PSUTIL:
+        return _get_llm_processes_psutil()
+    return _get_llm_processes_ps()
 
 
 def load_claude_sessions() -> dict[int, dict]:
@@ -269,29 +383,34 @@ def get_gpu_utilization() -> int | None:
     return int(m.group(1)) if m else None
 
 
-_SESSION_INFO_CACHE: dict[str, tuple[float, str | None]] = {}
+_SESSION_INFO_CACHE: dict[str, tuple[float, str | None, int | None]] = {}
 
 
-def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | None]:
-    """Return (model, last_activity_mtime) for a Claude session via its transcript jsonl."""
+def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | None, int | None]:
+    """Return (model, last_activity_mtime, context_tokens) for a Claude session.
+
+    context_tokens is the size of the most recent assistant turn's input context
+    (input + cache_creation + cache_read), matching what /context reports.
+    """
     if not cwd or not session_id:
-        return None, None
+        return None, None, None
     encoded = cwd.replace("/", "-")
     path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return None, None
+        return None, None, None
     key = str(path)
     cached = _SESSION_INFO_CACHE.get(key)
     if cached and cached[0] == mtime:
-        return cached[1], mtime
+        return cached[1], mtime, cached[2]
     model = None
+    ctx_tokens = None
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - 32768))
+            f.seek(max(0, size - 65536))
             tail = f.read().decode("utf-8", errors="ignore")
         for line in reversed(tail.splitlines()):
             try:
@@ -299,13 +418,128 @@ def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | Non
             except json.JSONDecodeError:
                 continue
             msg = d.get("message")
-            if isinstance(msg, dict) and msg.get("model"):
+            if not isinstance(msg, dict):
+                continue
+            usage = msg.get("usage")
+            if ctx_tokens is None and isinstance(usage, dict):
+                ctx_tokens = (
+                    int(usage.get("input_tokens") or 0)
+                    + int(usage.get("cache_creation_input_tokens") or 0)
+                    + int(usage.get("cache_read_input_tokens") or 0)
+                )
+            if model is None and msg.get("model"):
                 model = msg["model"]
+            if model is not None and ctx_tokens is not None:
                 break
     except OSError:
         pass
-    _SESSION_INFO_CACHE[key] = (mtime, model)
-    return model, mtime
+    _SESSION_INFO_CACHE[key] = (mtime, model, ctx_tokens)
+    return model, mtime, ctx_tokens
+
+
+_RUNNING_AGENTS_CACHE: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _parse_iso_ts(ts: str | None) -> float | None:
+    """Parse an ISO 8601 timestamp (with trailing Z) to a unix float."""
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, AttributeError):
+        return None
+
+
+def get_running_subagents(cwd: str, session_id: str) -> list[dict]:
+    """Return subagents whose tool_use has no matching tool_result yet.
+
+    Each dict: {id, description, subagent_type, started_at}. Scans the tail
+    of the transcript (~2MB) which comfortably covers many recent turns.
+    """
+    if not cwd or not session_id:
+        return []
+    encoded = cwd.replace("/", "-")
+    path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return []
+    key = str(path)
+    cached = _RUNNING_AGENTS_CACHE.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    uses: dict[str, dict] = {}
+    results: set[str] = set()
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 2 * 1024 * 1024))
+            if f.tell() > 0:
+                f.readline()  # drop the partial first line
+            data = f.read().decode("utf-8", errors="ignore")
+        for line in data.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = d.get("message")
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            started = _parse_iso_ts(d.get("timestamp"))
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "tool_use" and block.get("name") in ("Agent", "Task"):
+                    bid = block.get("id")
+                    binput = block.get("input") or {}
+                    if bid:
+                        uses[bid] = {
+                            "id": bid,
+                            "description": binput.get("description", "") or "",
+                            "subagent_type": binput.get("subagent_type", "") or "",
+                            "started_at": started,
+                        }
+                elif btype == "tool_result":
+                    tuid = block.get("tool_use_id")
+                    if tuid:
+                        results.add(tuid)
+    except OSError:
+        return []
+
+    running = [u for uid, u in uses.items() if uid not in results]
+    running.sort(key=lambda u: u.get("started_at") or 0)
+    _RUNNING_AGENTS_CACHE[key] = (mtime, running)
+    return running
+
+
+def format_duration(secs: int) -> str:
+    """Compact duration: 42s, 3m12s, 1h05m."""
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def format_tokens(n: int | None) -> str:
+    """Human-readable token count: 0 -> '-', 12345 -> '12K', 1250000 -> '1.2M'."""
+    if n is None or n <= 0:
+        return "-"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n // 1000}K"
+    if n >= 1_000:
+        return f"{n / 1000:.1f}K"
+    return str(n)
 
 
 def short_model(model: str | None) -> str:
@@ -402,6 +636,7 @@ def draw(stdscr, interval: int):
     COL_CYAN = curses.color_pair(3) if curses.has_colors() else curses.A_NORMAL
     COL_YELLOW = curses.color_pair(4) if curses.has_colors() else curses.A_NORMAL
     COL_MAGENTA = curses.color_pair(5) if curses.has_colors() else curses.A_NORMAL
+    COL_WHITE = curses.color_pair(6) if curses.has_colors() else curses.A_NORMAL
     COL_DIM = curses.A_DIM
     COL_BOLD = curses.A_BOLD
 
@@ -425,6 +660,11 @@ def draw(stdscr, interval: int):
     claude_sessions: dict[int, dict] = {}
     ollama_models: list[dict] = []
     gpu: int | None = None
+    # LED state: previous token count per PID, and last-seen-active tick counter
+    # so a change keeps the LED lit for a couple of refresh ticks.
+    prev_tokens: dict[int, int] = {}
+    led_ticks: dict[int, int] = {}
+    LED_HOLD = 2
 
     while True:
         stdscr.erase()
@@ -436,9 +676,26 @@ def draw(stdscr, interval: int):
             claude_sessions = load_claude_sessions()
             ollama_models = get_ollama_running()
             gpu = get_gpu_utilization()
+            # Attach tokens to each proc so the sort key and LED can see them.
+            for p in procs:
+                p["tokens"] = None
+                if p["label"] == "Claude Code" and p["pid"] in claude_sessions:
+                    sess = claude_sessions[p["pid"]]
+                    _, _, tok = get_session_info(sess.get("cwd", ""), sess.get("sessionId", ""))
+                    p["tokens"] = tok
 
         procs.sort(key=SORT_MODES[sort_mode][1])
         now_str = datetime.now().strftime("%H:%M:%S")
+
+        # Age the LED hold counter and drop dead PIDs.
+        if not paused:
+            alive_pids = {p["pid"] for p in procs}
+            for pid in list(led_ticks.keys()):
+                if pid not in alive_pids:
+                    led_ticks.pop(pid, None)
+                    prev_tokens.pop(pid, None)
+                elif led_ticks[pid] > 0:
+                    led_ticks[pid] -= 1
 
         # -- Title bar --
         total_cpu = sum(p["cpu"] for p in procs)
@@ -463,7 +720,7 @@ def draw(stdscr, interval: int):
         row += 1  # blank line
 
         # -- Column headers --
-        hdr = f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TYPE':<20}  {'DETAILS'}"
+        hdr = f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TOKENS':>7}   {'TYPE':<20}  {'DETAILS'}"
         try:
             stdscr.addstr(row, 0, hdr[:max_x - 1], COL_BOLD | curses.A_UNDERLINE)
         except curses.error:
@@ -480,20 +737,21 @@ def draw(stdscr, interval: int):
         else:
             # -- Process rows --
             for p in procs:
-                if row >= max_y - 3:
+                if row >= max_y - 4:
                     break
 
                 pid = p["pid"]
                 label = p["label"]
                 details = ""
                 is_idle = False
+                tokens: int | None = None
 
                 # Enrich Claude Code rows with session info
                 if label == "Claude Code" and pid in claude_sessions:
                     sess = claude_sessions[pid]
                     cwd_full = sess.get("cwd", "")
                     cwd = shorten_path(cwd_full)
-                    model_id, last_active = get_session_info(cwd_full, sess.get("sessionId", ""))
+                    model_id, last_active, tokens = get_session_info(cwd_full, sess.get("sessionId", ""))
                     model = short_model(model_id)
                     model_tag = f" [{model}]" if model else ""
                     if last_active is not None:
@@ -515,15 +773,33 @@ def draw(stdscr, interval: int):
                         cmd = cmd[:47] + "..."
                     details = cmd
 
-                line = (
+                # Activity LED: block char. Blinking green = tokens flowing
+                # (count changed within the last LED_HOLD ticks). Steady amber
+                # = idle. Non-Claude rows get a blank slot.
+                led_char = " "
+                led_attr = curses.A_NORMAL
+                if label == "Claude Code":
+                    if not paused and tokens is not None:
+                        prev = prev_tokens.get(pid)
+                        if prev is not None and tokens != prev:
+                            led_ticks[pid] = LED_HOLD
+                        prev_tokens[pid] = tokens
+                    if led_ticks.get(pid, 0) > 0:
+                        led_char = "\u2588"  # full block
+                        led_attr = COL_GREEN | COL_BOLD | curses.A_BLINK
+                    else:
+                        led_char = "\u2588"
+                        led_attr = COL_WHITE
+
+                prefix = (
                     f"{pid:>7}  "
                     f"{p['cpu']:>5.1f}  "
                     f"{p['mem']:>5.1f}  "
                     f"{format_rss(p['rss_mb']):>6}  "
                     f"{p['elapsed']:>10}  "
-                    f"{label:<20}  "
-                    f"{details}"
+                    f"{format_tokens(tokens):>7} "
                 )
+                suffix = f" {label:<20}  {details}"
 
                 attr = LABEL_COLORS.get(label, curses.A_NORMAL)
                 if is_idle:
@@ -533,7 +809,13 @@ def draw(stdscr, interval: int):
                     attr = COL_RED | COL_BOLD
 
                 try:
-                    stdscr.addstr(row, 0, line[:max_x - 1], attr)
+                    stdscr.addstr(row, 0, prefix[:max_x - 1], attr)
+                    x = min(len(prefix), max_x - 1)
+                    if x < max_x - 1:
+                        stdscr.addstr(row, x, led_char, led_attr)
+                        x += 1
+                    if x < max_x - 1:
+                        stdscr.addstr(row, x, suffix[:max_x - 1 - x], attr)
                 except curses.error:
                     pass
                 row += 1
@@ -543,10 +825,14 @@ def draw(stdscr, interval: int):
                     sess_data = claude_sessions[pid]
                     tasks = sess_data.get("tasks", [])
                     subagents = sess_data.get("subagents", [])
+                    running_subs = get_running_subagents(
+                        sess_data.get("cwd", ""),
+                        sess_data.get("sessionId", ""),
+                    )
 
                     # Render main agent tasks
                     for t in tasks:
-                        if row >= max_y - 3:
+                        if row >= max_y - 4:
                             break
                         status = t.get("status", "pending")
                         if status == "completed":
@@ -559,19 +845,38 @@ def draw(stdscr, interval: int):
                         subj = t.get("subject", "")
                         if status == "in_progress":
                             subj = t.get("activeForm") or subj
-                        if len(subj) > 55:
-                            subj = subj[:52] + "..."
+                        if len(subj) > 70:
+                            subj = subj[:67] + "..."
 
-                        task_line = f"{'':>44}  {sym} {subj}"
+                        task_line = f"{'':>10}+- TASK {sym} {subj}"
                         try:
                             stdscr.addstr(row, 0, task_line[:max_x - 1], tattr)
                         except curses.error:
                             pass
                         row += 1
 
+                    # Render currently-running subagents parsed from the
+                    # transcript (tool_use without matching tool_result).
+                    now = time.time()
+                    for sub in running_subs:
+                        if row >= max_y - 4:
+                            break
+                        sa_type = sub.get("subagent_type") or "agent"
+                        desc = sub.get("description") or ""
+                        if len(desc) > 50:
+                            desc = desc[:47] + "..."
+                        started = sub.get("started_at")
+                        dur = format_duration(int(now - started)) if started else "?"
+                        sub_line = f"{'':>10}+- SUB  [{sa_type}] {desc}  ({dur})"
+                        try:
+                            stdscr.addstr(row, 0, sub_line[:max_x - 1], COL_MAGENTA | COL_BOLD)
+                        except curses.error:
+                            pass
+                        row += 1
+
                     # Render subagents
                     for sa in subagents:
-                        if row >= max_y - 3:
+                        if row >= max_y - 4:
                             break
                         todos = sa["todos"]
                         aid_short = sa["agent_id"][:8]
@@ -587,7 +892,7 @@ def draw(stdscr, interval: int):
 
                         # Show individual subagent todos
                         for t in todos:
-                            if row >= max_y - 3:
+                            if row >= max_y - 4:
                                 break
                             status = t.get("status", "pending")
                             if status == "completed":
@@ -603,18 +908,32 @@ def draw(stdscr, interval: int):
                             if len(content) > 50:
                                 content = content[:47] + "..."
 
-                            todo_line = f"{'':>44}  {sym} {content}"
+                            todo_line = f"{'':>54}  {sym} {content}"
                             try:
                                 stdscr.addstr(row, 0, todo_line[:max_x - 1], tattr)
                             except curses.error:
                                 pass
                             row += 1
 
-        # -- Footer --
+        # -- Legend + footer (two lines) --
+        legend_row = max_y - 2
         footer_row = max_y - 1
         sort_label = SORT_MODES[sort_mode][0]
+
+        # Inline legend with actual LED colors so the symbol matches the rows.
+        try:
+            stdscr.move(legend_row, 0)
+            stdscr.addstr(" LED: ", COL_BOLD)
+            stdscr.addstr("\u2588", COL_GREEN | COL_BOLD | curses.A_BLINK)
+            stdscr.addstr(" tokens flowing   ", curses.A_NORMAL)
+            stdscr.addstr("\u2588", COL_WHITE)
+            stdscr.addstr(" idle", curses.A_NORMAL)
+            stdscr.clrtoeol()
+        except curses.error:
+            pass
+
         footer = (
-            f" q:quit  p:cpu m:mem t:time  space:{'resume' if paused else 'pause'}"
+            f" q:quit  p:cpu m:mem t:time k:tok  space:{'resume' if paused else 'pause'}"
             f"  sort:{sort_label}  interval:{interval}s "
         )
         try:
@@ -638,6 +957,9 @@ def draw(stdscr, interval: int):
             elif key == ord("t"):
                 sort_mode = "time"
                 break
+            elif key == ord("k"):
+                sort_mode = "tok"
+                break
             elif key == ord(" "):
                 paused = not paused
                 break
@@ -654,19 +976,20 @@ def static_output():
         print("No LLM processes found.")
         return
 
-    print(f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TYPE':<20}  DETAILS")
-    print("-" * 90)
+    print(f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TOKENS':>7}  {'TYPE':<20}  DETAILS")
+    print("-" * 99)
 
     for p in procs:
         pid = p["pid"]
         label = p["label"]
         details = ""
+        tokens: int | None = None
 
         if label == "Claude Code" and pid in claude_sessions:
             sess = claude_sessions[pid]
             cwd_full = sess.get("cwd", "")
             cwd = shorten_path(cwd_full)
-            model_id, _ = get_session_info(cwd_full, sess.get("sessionId", ""))
+            model_id, _, tokens = get_session_info(cwd_full, sess.get("sessionId", ""))
             model = short_model(model_id)
             model_tag = f" [{model}]" if model else ""
             tasks = sess.get("tasks", [])
@@ -689,6 +1012,7 @@ def static_output():
             f"{p['mem']:>5.1f}  "
             f"{format_rss(p['rss_mb']):>6}  "
             f"{p['elapsed']:>10}  "
+            f"{format_tokens(tokens):>7}  "
             f"{label:<20}  "
             f"{details}"
         )
@@ -726,7 +1050,7 @@ def main():
                 pass
 
     if "--help" in sys.argv or "-h" in sys.argv:
-        print("ltop: A 'top'-like display for local LLM processes and Claude Code sessions")
+        print("ltop: A 'top'-like display for local LLM processes")
         print()
         print("Usage: ltop [OPTIONS]")
         print()
@@ -740,12 +1064,21 @@ def main():
         print("  p         Sort by CPU")
         print("  m         Sort by memory")
         print("  t         Sort by elapsed time")
+        print("  k         Sort by token count")
         print("  space     Pause / resume refresh")
         return
+
+    # Windows requires psutil (no ps) and windows-curses. Fail early with
+    # clear guidance rather than a confusing traceback.
+    if sys.platform.startswith("win") and not HAVE_PSUTIL:
+        print("ltop on Windows requires psutil: pip install psutil windows-curses",
+              file=sys.stderr)
+        sys.exit(1)
 
     if once or not sys.stdout.isatty():
         static_output()
     else:
+        locale.setlocale(locale.LC_ALL, "")
         try:
             curses.wrapper(lambda stdscr: draw(stdscr, interval))
         except KeyboardInterrupt:
