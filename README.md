@@ -5,14 +5,40 @@ A `top`-like terminal display for **local LLM processes** and **Claude Code sess
 ```
  ltop  |  4 processes  |  CPU: 38.2%  |  GPU: 47%  |  MEM: 7.0G  |  14:22:07
 
-    PID   CPU%   MEM%     RSS     ELAPSED  TYPE                  DETAILS
-  92046   17.0    0.9    604M    01:28:18  Claude Code           ~/code/api-server [opus-4.6]  [####::------] 3/8 Writing tests
-  89639   11.1    1.1    728M    04:08:10  Claude Code           ~/code/web-client [sonnet-4.5]
-  10816    2.6    2.3    1.4G  01-07:19:20  Claude Code           ~/code/cli-tool [opus-4.6]
-  14089    0.1    6.7    4.3G  01-02:29:44  Claude Code           ~/code/data-pipeline [opus-4.6]
+    PID   CPU%   MEM%     RSS     ELAPSED   TOKENS   TYPE                  DETAILS
+  92046   17.0    0.9    604M    01:28:18     124K █ Claude Code           ~/code/api-server [opus-4.6]  [##::--------] 2/8 Writing integration tests  (3 agents)
+          +- TASK [done] Scaffolded /v1/users endpoint
+          +- TASK [done] Wired Postgres fixture into pytest
+          +- TASK [ >> ] Writing integration tests
+          +- TASK [    ] Add rate-limit middleware
+          +- TASK [    ] Hook /v1/users into OpenAPI spec
+          +- SUB  [Explore] Map existing auth middleware usage  (00:00:42)
+          +-agent 4f9a1b27  [###:------] 1/3 Rewriting conftest
+                                                      [done] Delete stale pg_dump files
+                                                      [ >> ] Rewrite conftest to use session scope
+                                                      [    ] Verify xdist workers pass
+  89639   11.1    1.1    728M    04:08:10      82K █ Claude Code           ~/code/web-client [sonnet-4.5]  [####::------] 3/8 Wiring up auth provider
+          +- TASK [done] Pick OIDC library
+          +- TASK [done] Stub /login route
+          +- TASK [done] Stub /callback route
+          +- TASK [ >> ] Wiring up auth provider
+          +- TASK [    ] Persist tokens to IndexedDB
+  10816    2.6    2.3    1.4G  01-07:19:20      18K █ Claude Code           ~/code/cli-tool [opus-4.6]
+  14089    0.1    6.7    4.3G  01-02:29:44       -  █ Claude Code           ~/code/data-pipeline [opus-4.6]   (idle)
 
- q:quit  p:cpu m:mem t:time  space:pause  sort:CPU  interval:3s
+ LED: █ tokens flowing   █ idle
+ q:quit  p:cpu m:mem t:time k:tok  space:pause  sort:CPU  interval:3s
 ```
+
+A few things worth pointing out in that snapshot (they're easier to spot live, where color and blink do the work):
+
+- **TOKENS column** — current context size on the most recent assistant turn, formatted like `124K` / `1.2M`. Rows that don't map to a Claude session show `-`. Sortable with `k`.
+- **LED** between TOKENS and TYPE — blinks green when the token count just changed (tokens flowing), steady white otherwise. The idle `14089` row is also rendered dimmed in the TUI.
+- **Task progress bar** — `[##::--------]` = 2 done (`#`), 1 in-progress (`:`), 9 pending (`-`). The `2/8 Writing integration tests` after it is `done/total` plus the active task's `activeForm`.
+- **Expanded task list** — every TodoWrite task for that session is shown below its process with `[done]` / `[ >> ]` / `[    ]` markers.
+- **`+- SUB` line** — a sub-agent that the main session has invoked and is currently waiting on, parsed from the transcript (`tool_use` with no matching `tool_result` yet). Shows `subagent_type`, its `description`, and how long it's been running.
+- **`+-agent <id>` block** — a sub-agent's own todo list (from `~/.claude/todos/<sessionId>-agent-*.json`) with its own mini progress bar and the individual todos indented underneath.
+- **`(3 agents)` tag** — the main session plus any sub-agents with their own persisted todo files.
 
 ## Why another htop?
 
