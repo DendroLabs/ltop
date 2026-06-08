@@ -426,11 +426,13 @@ def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | Non
                 continue
             usage = msg.get("usage")
             if ctx_tokens is None and isinstance(usage, dict):
-                ctx_tokens = (
+                _ct = (
                     int(usage.get("input_tokens") or 0)
                     + int(usage.get("cache_creation_input_tokens") or 0)
                     + int(usage.get("cache_read_input_tokens") or 0)
                 )
+                if _ct > 0:
+                    ctx_tokens = _ct
             if model is None and msg.get("model"):
                 model = msg["model"]
             if model is not None and ctx_tokens is not None:
