@@ -22,7 +22,6 @@ except ImportError:
 CLAUDE_DIR = Path.home() / ".claude"
 SESSIONS_DIR = CLAUDE_DIR / "sessions"
 TASKS_DIR = CLAUDE_DIR / "tasks"
-TODOS_DIR = CLAUDE_DIR / "todos"
 
 OPENCODE_DB = Path.home() / ".local" / "share" / "opencode" / "opencode.db"
 
@@ -276,9 +275,6 @@ def load_claude_sessions() -> dict[int, dict]:
             if pid:
                 sid = data.get("sessionId", "")
                 data["tasks"] = load_tasks(sid)
-                main_todos, subagents = load_agents(sid)
-                data["main_todos"] = main_todos
-                data["subagents"] = subagents
                 sessions[pid] = data
         except (json.JSONDecodeError, OSError):
             continue
@@ -309,71 +305,6 @@ def load_tasks(session_id: str) -> list[dict]:
     return tasks
 
 
-def load_agents(session_id: str) -> tuple[list[dict], list[dict]]:
-    """Load main agent todos and subagent info from the todos directory.
-
-    Returns (main_todos, subagents) where each subagent is a dict with
-    'agent_id' and 'todos' keys.
-    """
-    if not TODOS_DIR.is_dir() or not session_id:
-        return [], []
-
-    main_todos = []
-    subagents = []
-    prefix = f"{session_id}-agent-"
-
-    for f in TODOS_DIR.iterdir():
-        if f.suffix != ".json" or not f.stem.startswith(prefix):
-            continue
-        agent_id = f.stem[len(prefix):]
-        try:
-            data = json.loads(f.read_text())
-            if not isinstance(data, list):
-                continue
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        if agent_id == session_id:
-            main_todos = data
-        else:
-            if data:  # only include subagents that have todos
-                subagents.append({
-                    "agent_id": agent_id,
-                    "todos": data,
-                })
-
-    return main_todos, subagents
-
-
-def agent_todo_summary(todos: list[dict]) -> str:
-    """One-line summary of a todo list."""
-    if not todos:
-        return ""
-    total = len(todos)
-    done = sum(1 for t in todos if t.get("status") == "completed")
-    active = [t for t in todos if t.get("status") == "in_progress"]
-    label = ""
-    if active:
-        t = active[0]
-        label = t.get("activeForm") or t.get("content", "")
-        if len(label) > 35:
-            label = label[:32] + "..."
-    return f"{done}/{total} {label}"
-
-
-def agent_progress_mini(todos: list[dict], width: int = 10) -> str:
-    """Tiny progress bar for a todo list."""
-    if not todos:
-        return ""
-    total = len(todos)
-    done = sum(1 for t in todos if t.get("status") == "completed")
-    active = sum(1 for t in todos if t.get("status") == "in_progress")
-    filled = round(done / total * width)
-    partial = round(active / total * width)
-    empty = width - filled - partial
-    return "#" * filled + ":" * partial + "-" * empty
-
-
 def get_gpu_utilization() -> int | None:
     """Sudoless macOS GPU utilization via ioreg. Returns 0-100 or None."""
     try:
@@ -387,29 +318,31 @@ def get_gpu_utilization() -> int | None:
     return int(m.group(1)) if m else None
 
 
-_SESSION_INFO_CACHE: dict[str, tuple[float, str | None, int | None]] = {}
+_SESSION_INFO_CACHE: dict[str, tuple[float, str | None, int | None, str | None]] = {}
 
 
-def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | None, int | None]:
-    """Return (model, last_activity_mtime, context_tokens) for a Claude session.
+def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | None, int | None, str | None]:
+    """Return (model, last_activity_mtime, context_tokens, effort) for a Claude session.
 
     context_tokens is the size of the most recent assistant turn's input context
     (input + cache_creation + cache_read), matching what /context reports.
+    effort is the effort level recorded on the most recent assistant line.
     """
     if not cwd or not session_id:
-        return None, None, None
+        return None, None, None, None
     encoded = cwd.replace("/", "-")
     path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return None, None, None
+        return None, None, None, None
     key = str(path)
     cached = _SESSION_INFO_CACHE.get(key)
     if cached and cached[0] == mtime:
-        return cached[1], mtime, cached[2]
+        return cached[1], mtime, cached[2], cached[3]
     model = None
     ctx_tokens = None
+    effort = None
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -435,12 +368,14 @@ def get_session_info(cwd: str, session_id: str) -> tuple[str | None, float | Non
                     ctx_tokens = _ct
             if model is None and msg.get("model"):
                 model = msg["model"]
-            if model is not None and ctx_tokens is not None:
+            if effort is None and d.get("effort"):
+                effort = str(d["effort"])
+            if model is not None and ctx_tokens is not None and effort is not None:
                 break
     except OSError:
         pass
-    _SESSION_INFO_CACHE[key] = (mtime, model, ctx_tokens)
-    return model, mtime, ctx_tokens
+    _SESSION_INFO_CACHE[key] = (mtime, model, ctx_tokens, effort)
+    return model, mtime, ctx_tokens, effort
 
 
 _OPENCODE_INFO_CACHE: dict[str, tuple[float, str | None, float | None, int | None]] = {}
@@ -542,9 +477,6 @@ def get_opencode_info(cwd: str | None) -> tuple[str | None, float | None, int | 
     return model, last_activity, ctx_tokens
 
 
-_RUNNING_AGENTS_CACHE: dict[str, tuple[float, list[dict]]] = {}
-
-
 def _parse_iso_ts(ts: str | None) -> float | None:
     """Parse an ISO 8601 timestamp (with trailing Z) to a unix float."""
     if not ts:
@@ -557,72 +489,124 @@ def _parse_iso_ts(ts: str | None) -> float | None:
         return None
 
 
-def get_running_subagents(cwd: str, session_id: str) -> list[dict]:
-    """Return subagents whose tool_use has no matching tool_result yet.
+_SUBAGENT_CACHE: dict[str, tuple[float, dict]] = {}
 
-    Each dict: {id, description, subagent_type, started_at}. Scans the tail
-    of the transcript (~2MB) which comfortably covers many recent turns.
+
+def _read_tail(path: Path, nbytes: int) -> str:
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        data = f.read()
+    return data.decode("utf-8", errors="ignore")
+
+
+def get_running_subagents(cwd: str, session_id: str) -> list[dict]:
+    """Return subagents of a session that have not finished yet.
+
+    Claude Code writes each subagent (foreground or background) to
+    ~/.claude/projects/<cwd>/<sessionId>/subagents/agent-<id>.jsonl with a
+    sibling .meta.json. An agent is finished when its last transcript line is
+    an assistant message whose stop_reason is neither null (still streaming)
+    nor "tool_use" (about to run a tool). Each dict: {id, description,
+    subagent_type, model, effort, tokens, started_at, last_active}.
     """
     if not cwd or not session_id:
         return []
     encoded = cwd.replace("/", "-")
-    path = Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
+    sub_dir = Path.home() / ".claude" / "projects" / encoded / session_id / "subagents"
+    if not sub_dir.is_dir():
         return []
-    key = str(path)
-    cached = _RUNNING_AGENTS_CACHE.get(key)
-    if cached and cached[0] == mtime:
-        return cached[1]
 
-    uses: dict[str, dict] = {}
-    results: set[str] = set()
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            f.seek(max(0, size - 2 * 1024 * 1024))
-            if f.tell() > 0:
-                f.readline()  # drop the partial first line
-            data = f.read().decode("utf-8", errors="ignore")
-        for line in data.splitlines():
+    running = []
+    for path in sub_dir.glob("agent-*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        key = str(path)
+        cached = _SUBAGENT_CACHE.get(key)
+        if cached and cached[0] == mtime:
+            info = cached[1]
+        else:
+            info = {
+                "id": path.stem[len("agent-"):],
+                "description": "",
+                "subagent_type": "",
+                "model": None,
+                "effort": None,
+                "tokens": None,
+                "started_at": None,
+                "last_active": mtime,
+                "done": False,
+            }
             try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            msg = d.get("message")
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            started = _parse_iso_ts(d.get("timestamp"))
-            for block in content:
-                if not isinstance(block, dict):
+                meta = json.loads(path.with_suffix(".meta.json").read_text())
+                info["description"] = meta.get("description", "") or ""
+                info["subagent_type"] = meta.get("agentType", "") or ""
+                info["model"] = meta.get("model") or None
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+            try:
+                with open(path, "rb") as f:
+                    first = f.readline().decode("utf-8", errors="ignore")
+                info["started_at"] = _parse_iso_ts(json.loads(first).get("timestamp"))
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+            try:
+                lines = _read_tail(path, 65536).splitlines()
+            except OSError:
+                lines = []
+            last_seen = False
+            for line in reversed(lines):
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
                     continue
-                btype = block.get("type")
-                if btype == "tool_use" and block.get("name") in ("Agent", "Task"):
-                    bid = block.get("id")
-                    binput = block.get("input") or {}
-                    if bid:
-                        uses[bid] = {
-                            "id": bid,
-                            "description": binput.get("description", "") or "",
-                            "subagent_type": binput.get("subagent_type", "") or "",
-                            "started_at": started,
-                        }
-                elif btype == "tool_result":
-                    tuid = block.get("tool_use_id")
-                    if tuid:
-                        results.add(tuid)
-    except OSError:
-        return []
+                msg = d.get("message")
+                if not last_seen:
+                    # The final line decides whether the agent is finished.
+                    last_seen = True
+                    if d.get("type") == "assistant" and isinstance(msg, dict):
+                        info["done"] = msg.get("stop_reason") not in (None, "tool_use")
+                if d.get("type") != "assistant" or not isinstance(msg, dict):
+                    continue
+                if info["effort"] is None and d.get("effort"):
+                    info["effort"] = str(d["effort"])
+                if msg.get("model"):
+                    info["model"] = msg["model"]
+                usage = msg.get("usage")
+                if isinstance(usage, dict):
+                    _ct = (
+                        int(usage.get("input_tokens") or 0)
+                        + int(usage.get("cache_creation_input_tokens") or 0)
+                        + int(usage.get("cache_read_input_tokens") or 0)
+                    )
+                    if _ct > 0:
+                        info["tokens"] = _ct
+                break
+            _SUBAGENT_CACHE[key] = (mtime, info)
+        if not info["done"]:
+            running.append(info)
 
-    running = [u for uid, u in uses.items() if uid not in results]
     running.sort(key=lambda u: u.get("started_at") or 0)
-    _RUNNING_AGENTS_CACHE[key] = (mtime, running)
     return running
+
+
+def format_subagent_line(sub: dict, now: float) -> str:
+    """One indented line for a running subagent, aligned under the parent row."""
+    sa_type = sub.get("subagent_type") or "agent"
+    desc = sub.get("description") or ""
+    if len(desc) > 50:
+        desc = desc[:47] + "..."
+    started = sub.get("started_at")
+    dur = format_duration(int(now - started)) if started else "?"
+    model = short_model(sub.get("model"))
+    effort = sub.get("effort") or ""
+    return (
+        f"{'':>10}+- SUB  {format_tokens(sub.get('tokens')):>7}  "
+        f"{model:<11}  {effort:<6}  [{sa_type}] {desc}  ({dur})"
+    )
 
 
 def format_duration(secs: int) -> str:
@@ -786,7 +770,7 @@ def draw(stdscr, interval: int):
                 p["tokens"] = None
                 if p["label"] == "Claude Code" and p["pid"] in claude_sessions:
                     sess = claude_sessions[p["pid"]]
-                    _, _, tok = get_session_info(sess.get("cwd", ""), sess.get("sessionId", ""))
+                    _, _, tok, _ = get_session_info(sess.get("cwd", ""), sess.get("sessionId", ""))
                     p["tokens"] = tok
 
         procs.sort(key=SORT_MODES[sort_mode][1])
@@ -825,7 +809,7 @@ def draw(stdscr, interval: int):
         row += 1  # blank line
 
         # -- Column headers --
-        hdr = f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TOKENS':>7}   {'TYPE':<20}  {'DETAILS'}"
+        hdr = f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TOKENS':>7}   {'MODEL':<11}  {'EFFORT':<6}  {'TYPE':<20}  {'DETAILS'}"
         try:
             stdscr.addstr(row, 0, hdr[:max_x - 1], COL_BOLD | curses.A_UNDERLINE)
         except curses.error:
@@ -850,36 +834,38 @@ def draw(stdscr, interval: int):
                 details = ""
                 is_idle = False
                 tokens: int | None = None
+                model = ""
+                effort = ""
+                running_subs: list[dict] = []
 
                 # Enrich Claude Code rows with session info
                 if label == "Claude Code" and pid in claude_sessions:
                     sess = claude_sessions[pid]
                     cwd_full = sess.get("cwd", "")
                     cwd = shorten_path(cwd_full)
-                    model_id, last_active, tokens = get_session_info(cwd_full, sess.get("sessionId", ""))
+                    model_id, last_active, tokens, effort_id = get_session_info(cwd_full, sess.get("sessionId", ""))
                     model = short_model(model_id)
-                    model_tag = f" [{model}]" if model else ""
+                    effort = effort_id or ""
                     if last_active is not None:
                         is_idle = (time.time() - last_active) > ACTIVE_WINDOW_SECONDS
                     tasks = sess.get("tasks", [])
-                    subagents = sess.get("subagents", [])
-                    n_agents = 1 + len(subagents)
+                    running_subs = get_running_subagents(cwd_full, sess.get("sessionId", ""))
+                    n_agents = 1 + len(running_subs)
                     agent_tag = f"  ({n_agents} agents)" if n_agents > 1 else ""
                     if tasks:
                         tsumm = task_summary(tasks)
                         pbar = progress_mini(tasks)
-                        details = f"{cwd}{model_tag}  [{pbar}] {tsumm}{agent_tag}"
+                        details = f"{cwd}  [{pbar}] {tsumm}{agent_tag}"
                     else:
-                        details = f"{cwd}{model_tag}{agent_tag}"
+                        details = f"{cwd}{agent_tag}"
                 elif label == "opencode":
                     cwd_full = get_process_cwd(pid)
                     model_id, last_active, tokens = get_opencode_info(cwd_full)
                     cwd = shorten_path(cwd_full) if cwd_full else ""
                     model = short_model(model_id)
-                    model_tag = f" [{model}]" if model else ""
                     if last_active is not None:
                         is_idle = (time.time() - last_active) > ACTIVE_WINDOW_SECONDS
-                    details = f"{cwd}{model_tag}".strip() or p["command"][:50]
+                    details = cwd or p["command"][:50]
                 else:
                     # Show shortened command
                     cmd = p["command"]
@@ -913,7 +899,7 @@ def draw(stdscr, interval: int):
                     f"{p['elapsed']:>10}  "
                     f"{format_tokens(tokens):>7} "
                 )
-                suffix = f" {label:<20}  {details}"
+                suffix = f" {model:<11}  {effort:<6}  {label:<20}  {details}"
 
                 attr = LABEL_COLORS.get(label, curses.A_NORMAL)
                 if is_idle:
@@ -938,11 +924,6 @@ def draw(stdscr, interval: int):
                 if label == "Claude Code" and pid in claude_sessions:
                     sess_data = claude_sessions[pid]
                     tasks = sess_data.get("tasks", [])
-                    subagents = sess_data.get("subagents", [])
-                    running_subs = get_running_subagents(
-                        sess_data.get("cwd", ""),
-                        sess_data.get("sessionId", ""),
-                    )
 
                     # Render main agent tasks
                     for t in tasks:
@@ -969,65 +950,21 @@ def draw(stdscr, interval: int):
                             pass
                         row += 1
 
-                    # Render currently-running subagents parsed from the
-                    # transcript (tool_use without matching tool_result).
+                    # Render running subagents (foreground and background),
+                    # read from the session's subagents/ transcript directory.
                     now = time.time()
                     for sub in running_subs:
                         if row >= max_y - 4:
                             break
-                        sa_type = sub.get("subagent_type") or "agent"
-                        desc = sub.get("description") or ""
-                        if len(desc) > 50:
-                            desc = desc[:47] + "..."
-                        started = sub.get("started_at")
-                        dur = format_duration(int(now - started)) if started else "?"
-                        sub_line = f"{'':>10}+- SUB  [{sa_type}] {desc}  ({dur})"
+                        sub_line = format_subagent_line(sub, now)
+                        sub_attr = COL_MAGENTA | COL_BOLD
+                        if (now - (sub.get("last_active") or now)) > ACTIVE_WINDOW_SECONDS:
+                            sub_attr = COL_DIM
                         try:
-                            stdscr.addstr(row, 0, sub_line[:max_x - 1], COL_MAGENTA | COL_BOLD)
+                            stdscr.addstr(row, 0, sub_line[:max_x - 1], sub_attr)
                         except curses.error:
                             pass
                         row += 1
-
-                    # Render subagents
-                    for sa in subagents:
-                        if row >= max_y - 4:
-                            break
-                        todos = sa["todos"]
-                        aid_short = sa["agent_id"][:8]
-                        pbar = agent_progress_mini(todos)
-                        summ = agent_todo_summary(todos)
-
-                        sa_line = f"{'':>10}+-agent {aid_short}  [{pbar}] {summ}"
-                        try:
-                            stdscr.addstr(row, 0, sa_line[:max_x - 1], COL_MAGENTA)
-                        except curses.error:
-                            pass
-                        row += 1
-
-                        # Show individual subagent todos
-                        for t in todos:
-                            if row >= max_y - 4:
-                                break
-                            status = t.get("status", "pending")
-                            if status == "completed":
-                                sym, tattr = "[done]", COL_GREEN | COL_DIM
-                            elif status == "in_progress":
-                                sym, tattr = "[ >> ]", COL_MAGENTA
-                            else:
-                                sym, tattr = "[    ]", COL_DIM
-
-                            content = t.get("content", "")
-                            if status == "in_progress":
-                                content = t.get("activeForm") or content
-                            if len(content) > 50:
-                                content = content[:47] + "..."
-
-                            todo_line = f"{'':>54}  {sym} {content}"
-                            try:
-                                stdscr.addstr(row, 0, todo_line[:max_x - 1], tattr)
-                            except curses.error:
-                                pass
-                            row += 1
 
         # -- Legend + footer (two lines) --
         legend_row = max_y - 2
@@ -1090,30 +1027,33 @@ def static_output():
         print("No LLM processes found.")
         return
 
-    print(f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TOKENS':>7}  {'TYPE':<20}  DETAILS")
-    print("-" * 99)
+    print(f"{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'RSS':>6}  {'ELAPSED':>10}  {'TOKENS':>7}  {'MODEL':<11}  {'EFFORT':<6}  {'TYPE':<20}  DETAILS")
+    print("-" * 120)
 
     for p in procs:
         pid = p["pid"]
         label = p["label"]
         details = ""
         tokens: int | None = None
+        model = ""
+        effort = ""
+        running_subs: list[dict] = []
 
         if label == "Claude Code" and pid in claude_sessions:
             sess = claude_sessions[pid]
             cwd_full = sess.get("cwd", "")
             cwd = shorten_path(cwd_full)
-            model_id, _, tokens = get_session_info(cwd_full, sess.get("sessionId", ""))
+            model_id, _, tokens, effort_id = get_session_info(cwd_full, sess.get("sessionId", ""))
             model = short_model(model_id)
-            model_tag = f" [{model}]" if model else ""
+            effort = effort_id or ""
             tasks = sess.get("tasks", [])
-            subagents = sess.get("subagents", [])
-            n_agents = 1 + len(subagents)
+            running_subs = get_running_subagents(cwd_full, sess.get("sessionId", ""))
+            n_agents = 1 + len(running_subs)
             agent_tag = f"  ({n_agents} agents)" if n_agents > 1 else ""
             if tasks:
-                details = f"{cwd}{model_tag}  {task_summary(tasks)}{agent_tag}"
+                details = f"{cwd}  {task_summary(tasks)}{agent_tag}"
             else:
-                details = f"{cwd}{model_tag}{agent_tag}"
+                details = f"{cwd}{agent_tag}"
         else:
             cmd = p["command"]
             if len(cmd) > 50:
@@ -1127,18 +1067,16 @@ def static_output():
             f"{format_rss(p['rss_mb']):>6}  "
             f"{p['elapsed']:>10}  "
             f"{format_tokens(tokens):>7}  "
+            f"{model:<11}  "
+            f"{effort:<6}  "
             f"{label:<20}  "
             f"{details}"
         )
 
-        # Show subagents in static output too
-        if label == "Claude Code" and pid in claude_sessions:
-            for sa in claude_sessions[pid].get("subagents", []):
-                todos = sa["todos"]
-                aid_short = sa["agent_id"][:8]
-                pbar = agent_progress_mini(todos)
-                summ = agent_todo_summary(todos)
-                print(f"{'':>10}+-agent {aid_short}  [{pbar}] {summ}")
+        # Show running subagents in static output too
+        now = time.time()
+        for sub in running_subs:
+            print(format_subagent_line(sub, now))
 
 
 def main():

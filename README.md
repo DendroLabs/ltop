@@ -5,26 +5,23 @@ A `top`-like terminal display for **local LLM processes** and **Claude Code sess
 ```
  ltop  |  4 processes  |  CPU: 38.2%  |  GPU: 47%  |  MEM: 7.0G  |  14:22:07
 
-    PID   CPU%   MEM%     RSS     ELAPSED   TOKENS   TYPE                  DETAILS
-  92046   17.0    0.9    604M    01:28:18     124K █ Claude Code           ~/code/api-server [opus-4.6]  [##::--------] 2/8 Writing integration tests  (3 agents)
+    PID   CPU%   MEM%     RSS     ELAPSED   TOKENS   MODEL        EFFORT  TYPE                  DETAILS
+  92046   17.0    0.9    604M    01:28:18     124K █ opus-4.6     high    Claude Code           ~/code/api-server  [##::--------] 2/8 Writing integration tests  (3 agents)
           +- TASK [done] Scaffolded /v1/users endpoint
           +- TASK [done] Wired Postgres fixture into pytest
           +- TASK [ >> ] Writing integration tests
           +- TASK [    ] Add rate-limit middleware
           +- TASK [    ] Hook /v1/users into OpenAPI spec
-          +- SUB  [Explore] Map existing auth middleware usage  (00:00:42)
-          +-agent 4f9a1b27  [###:------] 1/3 Rewriting conftest
-                                                      [done] Delete stale pg_dump files
-                                                      [ >> ] Rewrite conftest to use session scope
-                                                      [    ] Verify xdist workers pass
-  89639   11.1    1.1    728M    04:08:10      82K █ Claude Code           ~/code/web-client [sonnet-4.5]  [####::------] 3/8 Wiring up auth provider
+          +- SUB      41K  sonnet-4.5   high    [Explore] Map existing auth middleware usage  (42s)
+          +- SUB     158K  sonnet-4.5   xhigh   [general-purpose] Rewrite conftest to session scope  (8m40s)
+  89639   11.1    1.1    728M    04:08:10      82K █ sonnet-4.5   medium  Claude Code           ~/code/web-client  [####::------] 3/8 Wiring up auth provider
           +- TASK [done] Pick OIDC library
           +- TASK [done] Stub /login route
           +- TASK [done] Stub /callback route
           +- TASK [ >> ] Wiring up auth provider
           +- TASK [    ] Persist tokens to IndexedDB
-  10816    2.6    2.3    1.4G  01-07:19:20      18K █ Claude Code           ~/code/cli-tool [opus-4.6]
-  14089    0.1    6.7    4.3G  01-02:29:44       -  █ Claude Code           ~/code/data-pipeline [opus-4.6]   (idle)
+  10816    2.6    2.3    1.4G  01-07:19:20      18K █ opus-4.6     high    Claude Code           ~/code/cli-tool
+  14089    0.1    6.7    4.3G  01-02:29:44       -  █ opus-4.6     high    Claude Code           ~/code/data-pipeline   (idle)
 
  LED: █ tokens flowing   █ idle
  q:quit  p:cpu m:mem t:time k:tok  space:pause  sort:CPU  interval:3s
@@ -33,12 +30,12 @@ A `top`-like terminal display for **local LLM processes** and **Claude Code sess
 A few things worth pointing out in that snapshot (they're easier to spot live, where color and blink do the work):
 
 - **TOKENS column** — current context size on the most recent assistant turn, formatted like `124K` / `1.2M`. Rows that don't map to a Claude session show `-`. Sortable with `k`.
-- **LED** between TOKENS and TYPE — blinks green when the token count just changed (tokens flowing), steady white otherwise. The idle `14089` row is also rendered dimmed in the TUI.
+- **MODEL / EFFORT columns** — the model id (e.g. `opus-4.6`) and effort level (`low` / `medium` / `high` / `xhigh`) recorded on the session's most recent assistant turn. opencode rows fill MODEL only.
+- **LED** between TOKENS and MODEL — blinks green when the token count just changed (tokens flowing), steady white otherwise. The idle `14089` row is also rendered dimmed in the TUI.
 - **Task progress bar** — `[##::--------]` = 2 done (`#`), 1 in-progress (`:`), 9 pending (`-`). The `2/8 Writing integration tests` after it is `done/total` plus the active task's `activeForm`.
 - **Expanded task list** — every TodoWrite task for that session is shown below its process with `[done]` / `[ >> ]` / `[    ]` markers.
-- **`+- SUB` line** — a sub-agent that the main session has invoked and is currently waiting on, parsed from the transcript (`tool_use` with no matching `tool_result` yet). Shows `subagent_type`, its `description`, and how long it's been running.
-- **`+-agent <id>` block** — a sub-agent's own todo list (from `~/.claude/todos/<sessionId>-agent-*.json`) with its own mini progress bar and the individual todos indented underneath.
-- **`(3 agents)` tag** — the main session plus any sub-agents with their own persisted todo files.
+- **`+- SUB` line** — a sub-agent (foreground or background) that is still running, read from the session's own `subagents/` transcript directory. Shows its context tokens, model, effort, agent type, `description`, and how long it's been running. A sub-agent whose transcript hasn't been written in 60s renders dimmed, like an idle session.
+- **`(3 agents)` tag** — the main session plus its currently-running sub-agents.
 
 ## Why another htop?
 
@@ -53,8 +50,8 @@ Existing tools cover one half of the picture:
 ## Features
 
 - **htop-style live view** of local LLM-adjacent processes with CPU%, MEM%, RSS, elapsed time.
-- **Claude Code session introspection** — resolves PID → session, shows cwd, model id (e.g. `opus-4.6`), task list with progress bar, subagent tree with per-agent todos.
-- **opencode session introspection** — resolves PID → cwd → session via opencode's SQLite store (`~/.local/share/opencode/opencode.db`), shows the same TOKENS column and `[model]` tag. Works regardless of the underlying provider (Anthropic direct, GitHub Copilot, etc.).
+- **Claude Code session introspection** — resolves PID → session, shows cwd, model id (e.g. `opus-4.6`), effort level, task list with progress bar, and running sub-agents (background ones included) with their own model/effort/tokens.
+- **opencode session introspection** — resolves PID → cwd → session via opencode's SQLite store (`~/.local/share/opencode/opencode.db`), shows the same TOKENS and MODEL columns. Works regardless of the underlying provider (Anthropic direct, GitHub Copilot, etc.).
 - **Idle/active dimming** — Claude and opencode sessions whose transcripts haven't been written in the last 60s render dimmed, so the session that's actually working right now jumps out.
 - **macOS GPU utilization** in the title bar, sudoless, via `ioreg`.
 - **Sort toggles** — `p` CPU, `m` memory, `t` elapsed time. **Pause** with space.
@@ -180,9 +177,9 @@ Patterns live in `LLM_PATTERNS` at the top of the script — easy to add your ow
 If a process is Claude Code, `ltop` cross-references:
 
 - `~/.claude/sessions/<pid>.json` → cwd, sessionId
-- `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` → most recent `message.model`, last-activity mtime
+- `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` → most recent `message.model`, `effort`, context tokens, last-activity mtime
 - `~/.claude/tasks/<sessionId>/*.json` → main task list with progress
-- `~/.claude/todos/<sessionId>-agent-*.json` → subagent todo trees
+- `~/.claude/projects/<encoded-cwd>/<sessionId>/subagents/agent-*.jsonl` + `.meta.json` → running sub-agents (description, agent type, model, effort, tokens). An agent counts as finished once its last transcript line is an assistant turn with a terminal `stop_reason`.
 
 Nothing to configure — if the session files exist, they show up.
 
