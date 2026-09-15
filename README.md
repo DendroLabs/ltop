@@ -45,7 +45,7 @@ Existing tools cover one half of the picture:
 - **llmtop** (different project) scrapes Prometheus metrics from vLLM/SGLang clusters — great for servers, irrelevant on a laptop.
 - **claude-dashboard / ccboard / agents-observe** monitor Claude Code sessions but ignore the rest of your local inference stack.
 
-`ltop` sits in the middle: one screen that shows **Ollama, llama.cpp, MLX, vLLM, LM Studio, Claude Code, Aider, diffusion, whisper** — and enriches Claude Code rows with model, cwd, subagent tree, and idle/active state.
+`ltop` sits in the middle: one screen that shows **Ollama, llama.cpp, MLX, vLLM, LM Studio, Claude Code, Aider, diffusion, whisper** — and enriches Claude Code rows with model, effort, cwd, running sub-agents, and idle/active state.
 
 ## Features
 
@@ -54,7 +54,7 @@ Existing tools cover one half of the picture:
 - **opencode session introspection** — resolves PID → cwd → session via opencode's SQLite store (`~/.local/share/opencode/opencode.db`), shows the same TOKENS and MODEL columns. Works regardless of the underlying provider (Anthropic direct, GitHub Copilot, etc.).
 - **Idle/active dimming** — Claude and opencode sessions whose transcripts haven't been written in the last 60s render dimmed, so the session that's actually working right now jumps out.
 - **macOS GPU utilization** in the title bar, sudoless, via `ioreg`.
-- **Sort toggles** — `p` CPU, `m` memory, `t` elapsed time. **Pause** with space.
+- **Sort toggles** — `p` CPU, `m` memory, `t` elapsed time, `k` context tokens. **Pause** with space.
 - **Ollama loaded-model banner** via `ollama ps`.
 - **Zero dependencies** — single Python file, Python 3.10+ stdlib only. No `pip install`, no build, no config.
 
@@ -160,6 +160,28 @@ ltop --help
 | `t`     | Sort by elapsed time      |
 | `k`     | Sort by token count       |
 | `space` | Pause / resume refresh    |
+
+## Columns
+
+```
++---------+------------------------------------------------------------------------+
+| Column  | Meaning                                                                |
++---------+------------------------------------------------------------------------+
+| PID     | Process id                                                             |
+| CPU%    | CPU usage (rows over 50% are highlighted red)                          |
+| MEM%    | Share of physical memory                                               |
+| RSS     | Resident set size                                                      |
+| ELAPSED | Time since the process started                                         |
+| TOKENS  | Context size of the most recent assistant turn (Claude Code, opencode) |
+| LED     | Green blink = tokens changed this tick; steady white = idle            |
+| MODEL   | Model on the most recent assistant turn, e.g. opus-4.6, sonnet-5       |
+| EFFORT  | Effort level on that turn: low / medium / high / xhigh (Claude Code)   |
+| TYPE    | Process type label from LLM_PATTERNS                                   |
+| DETAILS | cwd, task progress, (N agents) tag; or the shortened command line      |
++---------+------------------------------------------------------------------------+
+```
+
+Rows that can't be mapped to a session (Ollama, llama.cpp, a Claude Code session that hasn't produced its first reply yet) leave TOKENS, MODEL, and EFFORT blank. Below a Claude Code row, `+- TASK` lines list its task list and `+- SUB` lines list its running sub-agents, each with the sub-agent's own TOKENS, MODEL, and EFFORT.
 
 ## What it recognizes
 
